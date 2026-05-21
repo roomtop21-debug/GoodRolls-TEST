@@ -542,6 +542,7 @@
 
         let isBetProcessing = false;
         let isPromoProcessing = false;
+        let isCaseSpinning = false;
         let currentAdmTab = 'Users';
 
         onValue(userRef, (snap) => {
@@ -893,33 +894,31 @@
             document.getElementById('soloGameCrash').style.display = 'none';
         };
 
-        // --- SOLO КРАШ ИГРА (УЛУЧШЕНА ЛОГИКА, ИКСЫ И ТАЙМИНГИ) ---
+        // --- SOLO КРАШ ИГРА (ПОЛНОСТЬЮ ПЕРЕПИСАНА ЛОГИКА ТАЙМИНГОВ БЕЗ ЗАВИСАНИЙ) ---
         let myCrashBet = null;
         let crashPlayers = {};
         let lastCrashRoundId = 0;
         let isRoundCrashed = false;
 
-        function getCrashPointForRound(round, hasBets) {
+        // Детерминированная функция генерации Краша для всех игроков (чтобы иксы совпадали)
+        function getCrashPointForRound(round) {
             let n = Math.sin(round * 13.37) * 43758.5453123;
             let rand = n - Math.floor(n); 
-            if (hasBets) {
-                // Если кто-то поставил: Иксы от 1.00 до 3.00x, чаще всего единицы
-                if (rand < 0.60) return 1.00 + rand * 0.99; // 1.00 - 1.59 (частые единицы)
-                if (rand < 0.85) return 1.60 + (rand - 0.60) * 2.0; // 1.60 - 2.10
-                return 2.10 + (rand - 0.85) * 6.0; // 2.10 - 3.00
-            } else {
-                // Если никто не ставит: Иксы отличные (от 2x до 50x)
-                if (rand < 0.3) return 2.0 + rand * 10; 
-                if (rand < 0.7) return 5.0 + (rand - 0.3) * 20; 
-                return 13.0 + (rand - 0.7) * 123; 
-            }
+            // 0.00 to 0.50 -> 1.00x to 1.50x
+            if (rand < 0.50) return 1.00 + rand; 
+            // 0.50 to 0.80 -> 1.50x to 2.10x
+            if (rand < 0.80) return 1.50 + (rand - 0.50) * 2.0; 
+            // 0.80 to 0.95 -> 2.10x to 5.10x
+            if (rand < 0.95) return 2.10 + (rand - 0.80) * 20.0;
+            // 0.95 to 1.00 -> 5.10x to 55.10x
+            return 5.10 + (rand - 0.95) * 1000.0; 
         }
 
-        // ИСПРАВЛЕНА ИСТОРИЯ (ТЕПЕРЬ НОВЫЕ СЛЕВА, СТАРЫЕ СПРАВА)
-        function updateCrashHistory(currentRound) {
+        // ИСПРАВЛЕНА ИСТОРИЯ
+        function updateCrashHistory(currentRoundId) {
             let hist = '';
             for(let i=1; i<=5; i++) {
-                let cp = getCrashPointForRound(currentRound - i, true).toFixed(2);
+                let cp = getCrashPointForRound(currentRoundId - i).toFixed(2);
                 let color = cp >= 2.0 ? 'var(--success-green)' : (cp < 1.2 ? 'var(--text-muted)' : 'var(--error-red)');
                 hist += `<span style="color:${color}; background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:6px; font-size:12px; font-weight:800;">${cp}x</span>`;
             }
@@ -952,6 +951,40 @@
             if(list.innerHTML !== html) list.innerHTML = html;
         }
 
+        // УМНЫЙ СИНХРОНИЗАТОР РАУНДОВ БЕЗ ПРОСТОЕВ ПО ВРЕМЕНИ
+        let currentCrashState = null;
+        function updateCrashState(now) {
+            // Если мы всё еще в текущем вычисленном раунде - возвращаем его
+            if (currentCrashState && now >= currentCrashState.start && now < currentCrashState.end) {
+                return currentCrashState;
+            }
+            
+            // Если время вышло, вычисляем следующий. База - начало текущего дня UTC
+            const dayEpoch = Math.floor(now / 86400000) * 86400000;
+            let t = dayEpoch;
+            let roundId = Math.floor(dayEpoch / 86400000) * 100000; 
+            
+            // Оптимизация: чтобы не крутить с начала дня, продолжаем с последнего известного раунда
+            if (currentCrashState && currentCrashState.start > dayEpoch && now >= currentCrashState.end) {
+                t = currentCrashState.end;
+                roundId = currentCrashState.id + 1;
+            }
+            
+            while (t <= now) {
+                let cp = getCrashPointForRound(roundId); 
+                let crashTimeMs = (Math.log(cp) / Math.log(1.04)) * 1000;
+                // Раунд = 10 секунд ожидания + время полета + 2 секунды показа КРАШ
+                let duration = 10000 + crashTimeMs + 2000; 
+                
+                if (now >= t && now < t + duration) {
+                    currentCrashState = { id: roundId, start: t, end: t + duration, cp: cp, crashTimeMs: crashTimeMs };
+                    return currentCrashState;
+                }
+                t += duration;
+                roundId++;
+            }
+        }
+
         function loopCrash() {
             if (document.getElementById('soloGameCrash').style.display !== 'flex') {
                 requestAnimationFrame(loopCrash);
@@ -959,26 +992,20 @@
             }
             
             const now = Date.now();
-            const roundDuration = 30000; // Раунд 30 секунд (чтобы икс шел медленно)
-            const betDuration = 8000;    // 8 секунд отсчет
+            const state = updateCrashState(now);
+            const elapsed = now - state.start;
+            const betDuration = 10000; // 10 секунд на ставки
             
-            const roundId = Math.floor(now / roundDuration);
-            const roundStart = roundId * roundDuration;
-            const elapsed = now - roundStart;
-            
-            const hasBets = Object.keys(crashPlayers).length > 0;
-            const cp = getCrashPointForRound(roundId, hasBets);
-            
-            if (roundId !== lastCrashRoundId) {
-                lastCrashRoundId = roundId;
+            if (state.id !== lastCrashRoundId) {
+                lastCrashRoundId = state.id;
                 myCrashBet = null;
                 isRoundCrashed = false;
                 document.getElementById('crashBetControls').style.display = 'flex';
                 document.getElementById('btnCrashCashout').style.display = 'none';
                 document.getElementById('btnCrashBet').disabled = false;
                 document.getElementById('btnCrashBet').innerText = 'СТАВИТЬ';
-                updateCrashHistory(roundId);
-                listenToCrashBets(roundId);
+                updateCrashHistory(state.id);
+                listenToCrashBets(state.id);
             }
 
             const multContainer = document.getElementById('multiplier-display');
@@ -986,7 +1013,7 @@
             const statusEl = document.getElementById('crashStatus');
             const rocketContainer = document.getElementById('crashRocketContainer');
 
-            // ЕСЛИ ИДЕТ ОТСЧЕТ ДО ИГРЫ
+            // ЕСЛИ ИДЕТ ОТСЧЕТ ДО ИГРЫ (10 секунд)
             if (elapsed < betDuration) {
                 isRoundCrashed = false;
                 let left = ((betDuration - elapsed) / 1000).toFixed(1);
@@ -995,35 +1022,24 @@
                 rocketContainer.style.display = 'none'; // Убираем ракету
                 rocketContainer.classList.remove('rocket-flying');
                 
-                statusEl.innerText = left; // Просто секунды без слова "ОТСЧЕТ"
+                statusEl.innerText = "ОТСЧЕТ: " + left + "s";
                 statusEl.style.color = "var(--text-main)";
             } else {
                 // ФАЗА ПОЛЕТА ИЛИ КРАША
-                let t = (elapsed - betDuration) / 1000;
-                // Более медленный и плавный рост иксов - база изменена с 1.08 на 1.04
-                let currentMult = Math.pow(1.04, t); 
-                let crashTime = Math.log(cp) / Math.log(1.04);
+                let tMs = elapsed - betDuration;
+                let currentMult = Math.pow(1.04, tMs / 1000); 
 
-                if (t >= crashTime) {
-                    // КРАШ! Проверяем, сколько прошло времени с момента краша
+                if (tMs >= state.crashTimeMs) {
+                    // ФАЗА КРАША (Ровно 2 секунды)
                     isRoundCrashed = true;
-                    let timeSinceCrash = t - crashTime;
                     rocketContainer.classList.remove('rocket-flying');
+                    rocketContainer.style.display = 'none'; // Ракета исчезает
                     
-                    if (timeSinceCrash <= 1.0) {
-                        // ЭКРАН КРАША РОВНО 1 СЕКУНДУ
-                        multEl.innerText = cp.toFixed(2) + "x";
-                        multEl.style.color = "var(--error-red)";
-                        statusEl.innerText = "КРАШ!";
-                        statusEl.style.color = "var(--error-red)";
-                        rocketContainer.style.display = 'none'; // Ракета исчезает
-                    } else {
-                        // Сразу после 1 секунды Краша - показываем отсчет до следующего раунда (заменяет ПОДГОТОВКУ)
-                        multContainer.style.display = 'none';
-                        let nextRoundLeft = ((roundDuration - elapsed) / 1000).toFixed(1);
-                        statusEl.innerText = nextRoundLeft; 
-                        statusEl.style.color = "var(--text-main)";
-                    }
+                    multContainer.style.display = 'block'; 
+                    multEl.innerText = state.cp.toFixed(2) + "x";
+                    multEl.style.color = "var(--error-red)";
+                    statusEl.innerText = "КРАШ!";
+                    statusEl.style.color = "var(--error-red)";
                     
                     if (myCrashBet && !myCrashBet.cashedOut && !myCrashBet.lost) {
                         myCrashBet.lost = true;
@@ -1033,7 +1049,7 @@
                         document.getElementById('btnCrashBet').innerText = 'ПРОИГРЫШ';
                     }
                 } else {
-                    // РАКЕТА ЛЕТИТ (Анимация только через CSS, объект стоит на месте)
+                    // РАКЕТА ЛЕТИТ
                     isRoundCrashed = false;
                     multContainer.style.display = 'block'; 
                     rocketContainer.style.display = 'flex'; 
@@ -1041,7 +1057,7 @@
                     
                     multEl.innerText = currentMult.toFixed(2) + "x";
                     multEl.style.color = "var(--success-green)";
-                    statusEl.innerText = ""; // Без надписи "В ИГРЕ"
+                    statusEl.innerText = ""; 
                     
                     if (myCrashBet && !myCrashBet.cashedOut && !myCrashBet.lost) {
                         document.getElementById('crashBetControls').style.display = 'none';
@@ -1066,10 +1082,10 @@
             const amt = parseFloat(document.getElementById('crashBetInput').value);
             if (amt < 0.1 || myUser.balance < amt) return showGui("Недостаточно TON");
 
-            const roundDuration = 30000;
-            const betDuration = 8000;
-            const roundId = Math.floor(Date.now() / roundDuration);
-            const elapsed = Date.now() - (roundId * roundDuration);
+            const now = Date.now();
+            const state = updateCrashState(now);
+            const elapsed = now - state.start;
+            const betDuration = 10000;
             if (elapsed >= betDuration) return showGui("Раунд уже начался!");
 
             await update(userRef, { balance: Number((myUser.balance - amt).toFixed(2)) });
@@ -1078,8 +1094,7 @@
             document.getElementById('btnCrashBet').disabled = true;
             document.getElementById('btnCrashBet').innerText = 'СТАВКА ПРИНЯТА';
 
-            // ДОБАВЛЕНА КАРТИНКА TON ВМЕСТО ТЕКСТА
-            await set(ref(db, `live/crashBets/${roundId}/${myUser.id}`), {
+            await set(ref(db, `live/crashBets/${state.id}/${myUser.id}`), {
                 name: myUser.name,
                 photo: myUser.photo,
                 betHtml: `${amt.toFixed(2)} <img src="${TON_ICON_URL}" style="width:14px; height:14px; vertical-align:middle; margin-left:2px; margin-top:-2px;">`,
@@ -1090,10 +1105,10 @@
         window.placeGiftBetCrash = async (name, price) => {
             if (myCrashBet) return showGui("Ставка уже сделана");
             
-            const roundDuration = 30000;
-            const betDuration = 8000;
-            const roundId = Math.floor(Date.now() / roundDuration);
-            const elapsed = Date.now() - (roundId * roundDuration);
+            const now = Date.now();
+            const state = updateCrashState(now);
+            const elapsed = now - state.start;
+            const betDuration = 10000;
             if (elapsed >= betDuration) return showGui("Раунд уже начался!");
 
             let updatedGifts = {...myUser.gifts};
@@ -1105,8 +1120,7 @@
             document.getElementById('btnCrashBet').disabled = true;
             document.getElementById('btnCrashBet').innerText = 'СТАВКА ПРИНЯТА';
 
-            // ДОБАВЛЕНА КАРТИНКА ПОДАРКА ДЛЯ КРАША
-            await set(ref(db, `live/crashBets/${roundId}/${myUser.id}`), {
+            await set(ref(db, `live/crashBets/${state.id}/${myUser.id}`), {
                 name: myUser.name,
                 photo: myUser.photo,
                 betHtml: `<img src="${GIFT_ICON}" style="width:16px; height:16px; vertical-align:middle; margin-right:4px;"> ${name}`,
@@ -1117,19 +1131,16 @@
 
         window.cashoutCrash = async () => {
             if (!myCrashBet || myCrashBet.cashedOut || myCrashBet.lost) return;
-            const roundDuration = 30000;
-            const betDuration = 8000;
-            const roundId = Math.floor(Date.now() / roundDuration);
-            const elapsed = Date.now() - (roundId * roundDuration);
+            const now = Date.now();
+            const state = updateCrashState(now);
+            const elapsed = now - state.start;
+            const betDuration = 10000;
             if (elapsed < betDuration) return; 
             
-            const hasBets = Object.keys(crashPlayers).length > 0;
-            const cp = getCrashPointForRound(roundId, hasBets);
-            
-            let t = (elapsed - betDuration) / 1000;
-            let currentMult = Math.pow(1.04, t);
+            let tMs = elapsed - betDuration;
+            let currentMult = Math.pow(1.04, tMs / 1000);
 
-            if (currentMult < cp) {
+            if (currentMult < state.cp) {
                 myCrashBet.cashedOut = true;
                 
                 document.getElementById('btnCrashCashout').style.display = 'none';
@@ -1152,7 +1163,7 @@
                     await update(userRef, { balance: Number((myUser.balance + winTon).toFixed(2)) });
                 }
 
-                await update(ref(db, `live/crashBets/${roundId}/${myUser.id}`), {
+                await update(ref(db, `live/crashBets/${state.id}/${myUser.id}`), {
                     cashedOut: true,
                     win: winTon,
                     mult: currentMult
@@ -1708,41 +1719,6 @@
             document.getElementById('view-'+id).classList.add('active');
             document.getElementById('nav'+id.charAt(0).toUpperCase()+id.slice(1)).classList.add('active');
             document.getElementById('adminShield').style.display = (id === 'profile') ? 'block' : 'none';
-        }
-
-        // НАТИВНАЯ КНОПКА НАЗАД В TELEGRAM WEB APP И ФИКС КНОПОК
-        if (window.Telegram && window.Telegram.WebApp) {
-            const tg = window.Telegram.WebApp;
-            tg.ready();
-            
-            tg.BackButton.onClick(() => {
-                if (document.querySelector('.modal.active')) {
-                    closeModals();
-                } 
-                else if (document.getElementById('giftSheet').classList.contains('show') || document.getElementById('winnerSheet').classList.contains('show')) {
-                    closeGiftSheet();
-                    document.getElementById('winnerSheet').classList.remove('show');
-                } 
-                else if (document.getElementById('soloMenu').style.display === 'none' && document.getElementById('view-solo').classList.contains('active')) {
-                    backToSoloMenu();
-                } 
-                else {
-                    switchTab('rolls');
-                }
-            });
-
-            setInterval(() => {
-                const isMainRolls = document.getElementById('view-rolls').classList.contains('active');
-                const hasModals = document.querySelector('.modal.active') || document.getElementById('giftSheet').classList.contains('show') || document.getElementById('winnerSheet').classList.contains('show');
-                
-                const inSoloGame = document.getElementById('view-solo').classList.contains('active') && document.getElementById('soloMenu').style.display === 'none';
-
-                if (isMainRolls && !hasModals && !inSoloGame) {
-                    tg.BackButton.hide();
-                } else {
-                    tg.BackButton.show();
-                }
-            }, 300);
         }
     </script>
 </body>
